@@ -1,0 +1,621 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# 1. НАСТРОЙКИ
+# ============================================================
+
+N = 15
+L = 12.0
+T = 0.2
+
+dt = 0.001
+n_steps = 100000
+n_eq = 5000
+
+save_every = 10
+seed = 42
+
+n_k = 12              # Число волновых чисел в каждом направлении
+omega_max = 30.0       # Верхняя граница частоты на графике
+
+# Масса частицы и постоянная Больцмана приняты равными 1.
+# Все величины заданы в условных единицах.
+
+
+# ============================================================
+# 2. ПОТЕНЦИАЛЫ И СИЛЫ
+# ============================================================
+
+def V_LJ(r):
+    """Потенциал Леннарда — Джонса 6–12."""
+    return 4 * (1 / r**12 - 1 / r**6)
+
+
+def F_LJ(r):
+    """Радиальная сила F = -dV/dr."""
+    return 24 * (2 / r**13 - 1 / r**7)
+
+
+def V_24(r):
+    """Потенциал 2–4."""
+    return 1 / r**4 - 1 / r**2
+
+
+def F_24(r):
+    """Радиальная сила F = -dV/dr."""
+    return 4 / r**5 - 2 / r**3
+
+
+def get_potential(potential):
+    if potential == "6-12":
+        return V_LJ, F_LJ, 2.5
+
+    if potential == "2-4":
+        return V_24, F_24, 4.5
+
+    raise ValueError(
+        "Потенциал должен быть '6-12' или '2-4'."
+    )
+
+
+# ============================================================
+# 3. СИЛЫ И ПОТЕНЦИАЛЬНАЯ ЭНЕРГИЯ
+# ============================================================
+
+def forces_and_energy(pos, L, potential, r_cut):
+    V, force, _ = get_potential(potential)
+
+    n = len(pos)
+
+    # Каждая пара учитывается один раз: i < j
+    i, j = np.triu_indices(n, k=1)
+
+    d = pos[i] - pos[j]
+
+    # Ближайший образ при периодических границах
+    d -= L * np.round(d / L)
+
+    r = np.linalg.norm(d, axis=1)
+
+    if np.any(r == 0):
+        raise ValueError("Совпали координаты двух частиц.")
+
+    mask = r < r_cut
+
+    i = i[mask]
+    j = j[mask]
+    d = d[mask]
+    r = r[mask]
+
+    F = np.zeros_like(pos, dtype=float)
+
+    # Сила на частицу i со стороны j
+    fvec = force(r)[:, None] * d / r[:, None]
+
+    # Равные по модулю противоположные силы
+    np.add.at(F, i, fvec)
+    np.add.at(F, j, -fvec)
+
+    # Сдвиг потенциала обеспечивает U(r_cut) = 0.
+    # За пределами отсечения взаимодействие отсутствует.
+    E_pot = np.sum(V(r) - V(r_cut))
+
+    return F, E_pot
+
+
+# ============================================================
+# 4. ДВИЖЕНИЕ МЕТОДОМ ЭЙЛЕРА
+# ============================================================
+
+def run_md_euler(
+    N,
+    L,
+    T,
+    dt,
+    n_steps,
+    n_eq,
+    potential,
+    seed,
+    save_every
+):
+    _, _, r_cut = get_potential(potential)
+
+    if not isinstance(N, (int, np.integer)) or N < 2:
+        raise ValueError("N должно быть целым и не меньше 2.")
+
+    if L <= 0 or dt <= 0 or T < 0:
+        raise ValueError("Нужны L > 0, dt > 0, T >= 0.")
+
+    if n_steps < 1 or save_every < 1:
+        raise ValueError("Проверьте n_steps и save_every.")
+
+    if not 0 <= n_eq < n_steps:
+        raise ValueError("Нужно 0 <= n_eq < n_steps.")
+
+    if n_steps % save_every != 0:
+        raise ValueError(
+            "Для равномерной записи n_steps должен "
+            "делиться на save_every."
+        )
+
+    if r_cut >= L / 2:
+        raise ValueError("Нужно L > 2*r_cut.")
+
+    rng = np.random.default_rng(seed)
+
+    # --------------------------------------------------------
+    # Начальные координаты
+    # --------------------------------------------------------
+
+    positions = []
+
+    for _ in range(100000):
+        p = rng.uniform(-L / 2, L / 2, size=2)
+
+        if positions:
+            d = p - np.asarray(positions)
+            d -= L * np.round(d / L)
+
+            if np.any(
+                np.linalg.norm(d, axis=1) <= 1.2
+            ):
+                continue
+
+        positions.append(p)
+
+        if len(positions) == N:
+            break
+
+    if len(positions) != N:
+        raise ValueError(
+            "Не удалось разместить частицы. Увеличьте L."
+        )
+
+    pos = np.array(positions)
+
+    # --------------------------------------------------------
+    # Начальные скорости
+    # --------------------------------------------------------
+
+    vel = rng.normal(
+        0,
+        np.sqrt(T),
+        size=(N, 2)
+    )
+
+    # Убираем скорость центра масс
+    vel -= vel.mean(axis=0)
+
+    dof = 2 * N - 2
+
+    if T > 0:
+        T_now = np.sum(vel**2) / dof
+        vel *= np.sqrt(T / T_now)
+
+    acc, _ = forces_and_energy(
+        pos, L, potential, r_cut
+    )
+
+    hist_pos = [pos.copy()]
+    hist_vel = [vel.copy()]
+    times = [0.0]
+
+    # --------------------------------------------------------
+    # Основной цикл
+    # --------------------------------------------------------
+
+    for step in range(1, n_steps + 1):
+
+        # Полунеявный Эйлер:
+        # сначала новая скорость,
+        # затем координаты с новой скоростью.
+        vel = vel + acc * dt
+        pos = pos + vel * dt
+
+        # Периодические границы
+        pos = (pos + L / 2) % L - L / 2
+
+        acc, _ = forces_and_energy(
+            pos, L, potential, r_cut
+        )
+
+        # Поддержание температуры только во время прогрева
+        if step <= n_eq:
+            if T == 0:
+                vel[:] = 0.0
+
+            else:
+                T_now = np.sum(vel**2) / dof
+
+                if T_now > 0:
+                    vel *= np.sqrt(T / T_now)
+
+        if step % save_every == 0:
+            if not (
+                np.all(np.isfinite(pos))
+                and np.all(np.isfinite(vel))
+            ):
+                raise RuntimeError(
+                    "Расчёт потерял устойчивость. Уменьшите dt."
+                )
+
+            times.append(step * dt)
+            hist_pos.append(pos.copy())
+            hist_vel.append(vel.copy())
+
+        if step % 20000 == 0:
+            print(
+                f"  {potential}: {step}/{n_steps} шагов",
+                flush=True
+            )
+
+    return (
+        np.array(hist_pos),
+        np.array(hist_vel),
+        np.array(times),
+        r_cut
+    )
+
+
+# ============================================================
+# 5. ЭНЕРГИИ
+# ============================================================
+
+def compute_energies(
+    hist_pos,
+    hist_vel,
+    L,
+    potential,
+    r_cut
+):
+    E_pot = np.array([
+        forces_and_energy(
+            pos, L, potential, r_cut
+        )[1]
+        for pos in hist_pos
+    ])
+
+    E_kin = 0.5 * np.sum(
+        hist_vel**2,
+        axis=(1, 2)
+    )
+
+    E_total = E_pot + E_kin
+
+    return E_pot, E_kin, E_total
+
+
+# ============================================================
+# 6. СПЕКТРЫ КОЛЛЕКТИВНЫХ КОЛЕБАНИЙ
+# ============================================================
+
+def current_spectra(
+    data,
+    L,
+    t_start,
+    direction=(1.0, 0.0),
+    n_k=12
+):
+    # Анализируем только участок после прогрева
+    mask = data["t"] >= t_start
+
+    t = data["t"][mask]
+    R = data["pos"][mask]
+    V = data["vel"][mask]
+
+    if len(t) < 8:
+        raise ValueError("Недостаточно кадров для спектра.")
+
+    steps = np.diff(t)
+
+    if not np.allclose(steps, steps[0]):
+        raise ValueError(
+            "Кадры должны быть сохранены равномерно по времени."
+        )
+
+    dt_saved = steps[0]
+    n_frames = len(t)
+    n_particles = R.shape[1]
+
+    # Единичный вектор вдоль выбранного направления
+    e_L = np.array(direction, dtype=float)
+
+    if np.linalg.norm(e_L) == 0:
+        raise ValueError("Направление не должно быть нулевым.")
+
+    e_L /= np.linalg.norm(e_L)
+
+    # Перпендикулярный единичный вектор
+    e_T = np.array([-e_L[1], e_L[0]])
+
+    # Для выбранных направлений x и y:
+    # k_n = 2*pi*n/L
+    k_values = (
+        2 * np.pi / L
+        * np.arange(1, n_k + 1)
+    )
+
+    # Проекции координат на направление волнового вектора
+    R_parallel = R @ e_L
+
+    # exp(-i*k*r)
+    phase = np.exp(
+        -1j
+        * R_parallel[:, :, None]
+        * k_values[None, None, :]
+    )
+
+    # Проекции скоростей
+    V_parallel = V @ e_L
+    V_transverse = V @ e_T
+
+    # Коллективные токи для каждого k и момента времени
+    J_L = np.sum(
+        V_parallel[:, :, None] * phase,
+        axis=1
+    )
+
+    J_T = np.sum(
+        V_transverse[:, :, None] * phase,
+        axis=1
+    )
+
+    # Угловые частоты: omega = 2*pi*f
+    omega_all = (
+        2 * np.pi
+        * np.fft.fftfreq(n_frames, d=dt_saved)
+    )
+
+    positive = np.where(omega_all > 0)[0]
+    omega = omega_all[positive]
+
+    # Окно Ханна уменьшает спектральные утечки
+    window = np.hanning(n_frames)[:, None]
+
+    spectra = []
+
+    for J in (J_L, J_T):
+
+        # Убираем постоянную составляющую
+        J = J - J.mean(axis=0, keepdims=True)
+
+        # Ток комплексный, поэтому используем обычную FFT
+        amplitude = np.fft.fft(
+            J * window,
+            axis=0
+        )
+
+        power = np.abs(amplitude)**2
+
+        # Усредняем спектр по знакам частоты
+        power = 0.5 * (
+            power[positive]
+            + power[(-positive) % n_frames]
+        )
+
+        power *= (
+            dt_saved
+            / (n_particles * np.sum(window**2))
+        )
+
+        spectra.append(power)
+
+    return (
+        k_values,
+        omega,
+        spectra[0],
+        spectra[1]
+    )
+
+
+# ============================================================
+# 7. ЗАПУСК ДВУХ МОДЕЛЕЙ
+# ============================================================
+
+results = {}
+
+for potential in ("6-12", "2-4"):
+    print(
+        f"\nРасчёт потенциала {potential}...",
+        flush=True
+    )
+
+    pos, vel, t, r_cut = run_md_euler(
+        N=N,
+        L=L,
+        T=T,
+        dt=dt,
+        n_steps=n_steps,
+        n_eq=n_eq,
+        potential=potential,
+        seed=seed,
+        save_every=save_every
+    )
+
+    Ep, Ek, Et = compute_energies(
+        pos,
+        vel,
+        L,
+        potential,
+        r_cut
+    )
+
+    results[potential] = {
+        "pos": pos,
+        "vel": vel,
+        "t": t,
+        "Ep": Ep,
+        "Ek": Ek,
+        "Et": Et
+    }
+
+    post = t >= n_eq * dt
+    E_post = Et[post]
+
+    print(
+        "  Разброс полной энергии после прогрева: "
+        f"{np.ptp(E_post):.6g}"
+    )
+
+    print(
+        "  Изменение полной энергии после прогрева: "
+        f"{E_post[-1] - E_post[0]:.6g}"
+    )
+
+    n_frames = np.count_nonzero(post)
+    dt_saved = dt * save_every
+
+    print(
+        "  Шаг частотной сетки: "
+        f"{2 * np.pi / (n_frames * dt_saved):.6g}"
+    )
+
+
+# ============================================================
+# 8. ГРАФИКИ ЭНЕРГИЙ
+# ============================================================
+
+fig, axes = plt.subplots(
+    1, 3,
+    figsize=(17, 4.5)
+)
+
+energy_keys = ("Ep", "Ek", "Et")
+
+titles = (
+    "Потенциальная энергия",
+    "Кинетическая энергия",
+    "Полная энергия"
+)
+
+ylabels = (
+    r"$E_{pot}$",
+    r"$E_{kin}$",
+    r"$E_{total}$"
+)
+
+for name, data in results.items():
+    for ax, key in zip(axes, energy_keys):
+        ax.plot(
+            data["t"],
+            data[key],
+            label=name,
+            linewidth=1
+        )
+
+for ax, title, ylabel in zip(
+    axes, titles, ylabels
+):
+    if n_eq > 0:
+        ax.axvspan(
+            0,
+            n_eq * dt,
+            color="gray",
+            alpha=0.15,
+            label="Прогрев"
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel("Время t")
+    ax.set_ylabel(ylabel)
+
+    ax.grid(alpha=0.3)
+    ax.legend()
+
+fig.tight_layout()
+
+
+# ============================================================
+# 9. СПЕКТРАЛЬНЫЕ КАРТЫ ПО ДВУМ НАПРАВЛЕНИЯМ
+# ============================================================
+
+directions = (
+    ((1.0, 0.0), "x"),
+    ((0.0, 1.0), "y")
+)
+
+for direction, axis_name in directions:
+
+    fig, axes = plt.subplots(
+        2, 2,
+        figsize=(12, 9)
+    )
+
+    for row, (name, data) in enumerate(results.items()):
+
+        k_values, omega, P_L, P_T = current_spectra(
+            data=data,
+            L=L,
+            t_start=n_eq * dt,
+            direction=direction,
+            n_k=n_k
+        )
+
+        visible = omega <= omega_max
+
+        if np.count_nonzero(visible) < 2:
+            raise ValueError(
+                "В выбранном диапазоне слишком мало частот. "
+                "Увеличьте время моделирования или omega_max."
+            )
+
+        modes = (
+            (P_L, "Продольные"),
+            (P_T, "Поперечные")
+        )
+
+        for column, (power, mode_name) in enumerate(modes):
+            ax = axes[row, column]
+
+            # Отдельная нормировка каждой карты.
+            # Цвет показывает относительную интенсивность.
+            scale = max(float(power.max()), 1e-30)
+
+            intensity = np.log10(
+                power[visible] / scale + 1e-12
+            )
+
+            image = ax.pcolormesh(
+                k_values,
+                omega[visible],
+                intensity,
+                shading="auto",
+                cmap="inferno",
+                vmin=-4,
+                vmax=0
+            )
+
+            if axis_name == "x":
+                ax.set_xlabel(r"$k_x$, при $k_y=0$")
+            else:
+                ax.set_xlabel(r"$k_y$, при $k_x=0$")
+
+            ax.set_ylabel(r"$\omega$")
+
+            ax.set_title(
+                f"{name}: {mode_name} колебания"
+            )
+
+            fig.colorbar(
+                image,
+                ax=ax,
+                label=r"$\log_{10}(P/P_{\max})$"
+            )
+
+    fig.suptitle(
+        f"Спектры колебаний: направление {axis_name}",
+        fontsize=14
+    )
+
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+
+
+# ============================================================
+# 10. ПОКАЗ ВСЕХ ГРАФИКОВ
+# ============================================================
+
+print("\nГотово: показываю графики.", flush=True)
+
+plt.show()
