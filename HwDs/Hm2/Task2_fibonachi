@@ -1,0 +1,18 @@
+module fibonacci_2 (
+  input  logic       clk,
+  input  logic       rst,
+  output logic [15:0] num,
+  output logic [15:0] num2
+);
+logic [15:0]  fb_1, fb_2;
+always_ff @ (posedge clk)
+if (rst) begin
+    fb_1<=16'd1;
+    fb_2<=16'd1;
+end else begin
+    fb_1<=fb_1+fb_2;
+    fb_2<= fb_1 + 2*fb_2;
+end
+    assign num=fb_1;
+    assign num2=fb_2;
+endmodule

@@ -1,0 +1,19 @@
+module one_cycle_pulse_detector (
+  input  logic clk,
+  input  logic rst,
+  input  logic a,
+  output logic detected
+);
+ logic a_r1, a_r2;
+ always_ff @ (posedge clk)
+ if(rst) begin
+    a_r2<='0;
+    a_r1<='0;
+ end else begin
+     a_r1<=a;
+     a_r2<=a_r1;
+ end
+assign detected=~a&a_r1&~a_r2; //010
+
+
+endmodule
